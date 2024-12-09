@@ -925,17 +925,52 @@ class CodeAttn(nn.Module):
 
 
 class LSTMWithAttention_GNN(nn.Module):
-    def __init__(self, device, cond_vocab_size, proc_vocab_size, med_vocab_size, out_vocab_size,
-                 chart_vocab_size, lab_vocab_size, eth_vocab_size, gender_vocab_size,
-                 age_vocab_size, ins_vocab_size, modalities, embed_size, rnn_size, gnn_hidden_dim, output_dim, batch_size):
-        super(LSTMWithAttention_GNN, self).__init__()
-
+    def __init__(self, device, cond_vocab_size, cond_seq_len, proc_vocab_size, proc_seq_len, 
+                 med_vocab_size, med_seq_len, out_vocab_size, out_seq_len, chart_vocab_size, 
+                 chart_seq_len, lab_vocab_size, lab_seq_len, eth_vocab_size, gender_vocab_size, 
+                 age_vocab_size, med_signal, lab_signal, embed_size, rnn_size, gnn_hidden_dim, 
+                 output_dim, batch_size):
+        super(LSTMAttn_GCN, self).__init__()
         self.device = device
+        self.embed_size = embed_size
+        self.rnn_size = rnn_size
         self.batch_size = batch_size
-        self.modalities = modalities
+        self.cond_vocab_size = cond_vocab_size
+        self.cond_seq_len = cond_seq_len
+        self.modalities = 0  # Count modalities used
+        self.med_signal = med_signal
+        self.lab_signal = lab_signal
 
-        # Embedding layers for inputs
-        self.embedding = nn.Embedding(cond_vocab_size, embed_size)
+        # Embedding layers for modalities
+        if med_vocab_size:
+            self.med = nn.Embedding(med_vocab_size, embed_size)
+            self.modalities += 1
+
+        if proc_vocab_size:
+            self.proc = nn.Embedding(proc_vocab_size, embed_size)
+            self.modalities += 1
+
+        if out_vocab_size:
+            self.out = nn.Embedding(out_vocab_size, embed_size)
+            self.modalities += 1
+
+        if chart_vocab_size:
+            self.chart = nn.Embedding(chart_vocab_size, embed_size)
+            self.modalities += 1
+
+        if lab_vocab_size:
+            self.lab = nn.Embedding(lab_vocab_size, embed_size)
+            self.modalities += 1
+
+        # Condition embeddings
+        self.condEmbed = nn.Embedding(cond_vocab_size, embed_size)
+        self.condfc = nn.Linear(embed_size * cond_seq_len, rnn_size, False)
+
+        # Demographic embeddings
+        self.ethEmbed = nn.Embedding(eth_vocab_size, embed_size)
+        self.genderEmbed = nn.Embedding(gender_vocab_size, embed_size)
+        self.ageEmbed = nn.Embedding(age_vocab_size, embed_size)
+        self.demo_fc = nn.Linear(embed_size * 3, rnn_size, False)
 
         # LSTM for sequential data
         self.lstm = nn.LSTM(input_size=embed_size, hidden_size=rnn_size, batch_first=True)
@@ -943,49 +978,60 @@ class LSTMWithAttention_GNN(nn.Module):
         # Attention layer for LSTM outputs
         self.attention = nn.Linear(rnn_size, 1)
 
-        # GNN layers for graph-based learning
+        # GCN layers for graph-based learning
         self.gnn1 = GCNConv(rnn_size, gnn_hidden_dim)
         self.gnn2 = GCNConv(gnn_hidden_dim, output_dim)
 
-        # Fully connected layer for final output
-        self.fc = nn.Linear(output_dim, 1)  # Binary classification
+        # Fully connected layers for final predictions
+        self.fc1 = nn.Linear(rnn_size * (self.modalities + 2), int(rnn_size * (self.modalities + 2) / 2), False)
+        self.fc2 = nn.Linear(int(rnn_size * (self.modalities + 2) / 2), int(rnn_size * (self.modalities + 2) / 4), False)
+        self.fc3 = nn.Linear(int(rnn_size * (self.modalities + 2) / 4), 1, False)
 
-    def forward(self, meds, chart, out, proc, lab, stat, demo, edge_index):
-        # Embedding for sequential data
-        meds = meds.clamp(0, self.embedding.num_embeddings - 1)
-        meds = meds.view(-1, meds.shape[-1])  # Ensure batch-first processing
-        embedded = self.embedding(meds)  # (batch_size, seq_length, embed_size)
+    def forward(self, meds, chart, out, proc, lab, conds, demo, edge_index):
+        out1 = torch.zeros(size=(1, 0)).to(self.device)
 
-        # LSTM processing
-        lstm_out, _ = self.lstm(embedded)  # lstm_out: (batch_size, seq_length, rnn_size)
+        # Process modalities with embeddings and LSTM
+        for modality, data in zip([self.med, self.proc, self.out, self.chart, self.lab], 
+                                  [meds, proc, out, chart, lab]):
+            if data is not None and len(data) > 0:
+                embedded = modality(data.to(self.device))
+                lstm_out, _ = self.lstm(embedded)
+                attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
+                attn_weights = attn_weights.transpose(1, 2)
+                context = torch.bmm(attn_weights, lstm_out).squeeze(1)
+                if out1.nelement():
+                    out1 = torch.cat((out1, context), 1)
+                else:
+                    out1 = context
 
-        # Attention mechanism
-        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)  # (batch_size, seq_length, 1)
-        attn_weights = attn_weights.transpose(1, 2)  # (batch_size, 1, seq_length)
-        context = torch.bmm(attn_weights, lstm_out)  # (batch_size, 1, rnn_size)
-        context = context.squeeze(1)  # (batch_size, rnn_size)
+        # Process condition embeddings
+        conds = self.condEmbed(conds.to(self.device))
+        conds = conds.view(conds.shape[0], -1)
+        conds = self.condfc(conds)
+        out1 = torch.cat((out1, conds), 1)
 
-        # GNN processing
-        num_nodes = context.shape[0]
+        # Process demographic data
+        eth = self.ethEmbed(demo[:, 0].to(self.device))
+        gender = self.genderEmbed(demo[:, 1].to(self.device))
+        age = self.ageEmbed(demo[:, 2].to(self.device))
+        demo_features = torch.cat((eth, gender, age), 1)
+        demo_features = self.demo_fc(demo_features)
+        out1 = torch.cat((out1, demo_features), 1)
+
+        # GCN processing for graph-structured data
+        num_nodes = out1.shape[0]
         if edge_index.shape[1] > num_nodes:
             edge_index = edge_index[:, :num_nodes]  # Trim edge_index if it exceeds num_nodes
 
-        gnn_out = self.gnn1(context, edge_index)  # Pass through first GNN layer
-        gnn_out = torch.relu(gnn_out)  # Apply activation
-        gnn_out = self.gnn2(gnn_out, edge_index)  # Pass through second GNN layer
+        gnn_out = self.gnn1(out1, edge_index)
+        gnn_out = torch.relu(gnn_out)
+        gnn_out = self.gnn2(gnn_out, edge_index)
         gnn_out = torch.relu(gnn_out)
 
         # Final prediction
-        output = self.fc(gnn_out)  # (num_nodes, 1)
-
-        # Ensure output shape matches batch size
-        output = output.view(self.batch_size, -1).mean(dim=1, keepdim=True)  # Aggregate node outputs if needed
+        output = self.fc3(gnn_out)
+        output = output.view(self.batch_size, -1).mean(dim=1, keepdim=True)
         sig = nn.Sigmoid()
-        sigout=sig(output)
+        sigout = sig(output)
+
         return sigout, output
-
-
-
-
-
-
