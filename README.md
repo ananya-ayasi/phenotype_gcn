@@ -1,3 +1,6 @@
+
+![dict](https://github.com/user-attachments/assets/4e209ecf-782b-4421-adb5-1514ab725c1d)
+
 ## Files
 
 - **data_generation.py** and **data_generation_icu.py**
